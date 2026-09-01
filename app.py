@@ -27,6 +27,7 @@ import pandas as pd
 import requests
 import streamlit as st
 from bs4 import BeautifulSoup
+from openpyxl import Workbook, load_workbook
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
@@ -335,6 +336,215 @@ def parse_trades_url(html: str) -> str | None:
     if btn:
         return btn["data-url"]
     return None
+
+
+# --------------------------------------------------------------------------- #
+# Excel export (financials) - download, clean, reshape into a template
+# --------------------------------------------------------------------------- #
+
+
+def find_export_form(html: str):
+    """Locate the 'Export to Excel' button on a company page and the CSRF
+    token in its enclosing form. Returns (formaction, csrf_token) or
+    (None, None) if not found."""
+    soup = BeautifulSoup(html, "html.parser")
+    export_button = soup.find("button", attrs={"formaction": re.compile(r"/user/company/export/\d+/")})
+    if not export_button:
+        return None, None
+    formaction = export_button.get("formaction")
+    csrf_token = None
+    form = export_button.find_parent("form")
+    if form:
+        csrf_input = form.find("input", attrs={"name": "csrfmiddlewaretoken"})
+        if csrf_input:
+            csrf_token = csrf_input.get("value")
+    return formaction, csrf_token
+
+
+def download_company_excel(session: requests.Session, company_html: str, company_url: str,
+                            next_path: str) -> tuple[bytes | None, str | None]:
+    """Given an already-fetched company page, find its Export button and POST
+    to download the underlying Excel workbook. Returns (raw_bytes, error) -
+    on success error is None; on failure raw_bytes is None and error explains
+    why (login expired, rate limited, export button missing, etc.)."""
+    formaction, csrf_token = find_export_form(company_html)
+    if not formaction:
+        return None, "Could not find the Export button on this company page."
+    if not csrf_token:
+        csrf_token = session.cookies.get("csrftoken", "")
+
+    export_url = BASE + formaction
+    post_headers = {
+        "Accept": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,*/*",
+        "Referer": company_url,
+        "Origin": BASE,
+    }
+    post_data = {"csrfmiddlewaretoken": csrf_token, "next": next_path}
+    try:
+        r = session.post(export_url, headers=post_headers, data=post_data, timeout=30)
+    except requests.RequestException as e:
+        return None, f"Export request failed: {e}"
+    if r.status_code != 200:
+        return None, f"Export request returned HTTP {r.status_code}."
+
+    content = r.content
+    # XLSX files are ZIP archives - they must start with the "PK" magic bytes.
+    # Anything else means we got an HTML page back (login wall, rate limit,
+    # CSRF failure) rather than a real workbook.
+    if len(content) < 2 or content[:2] != b"PK":
+        snippet = content[:500].decode("utf-8", errors="replace").lower()
+        if "login" in snippet or "sign in" in snippet or "password" in snippet:
+            return None, "Screener returned a login page - your session cookie has likely expired."
+        if "csrf" in snippet or "forbidden" in snippet:
+            return None, "CSRF/permission error - try refreshing cookies and retrying."
+        return None, "Server returned something other than an Excel file (possibly rate-limited)."
+    return content, None
+
+
+def strip_empty_year_columns(wb) -> int:
+    """Mutates an in-memory openpyxl Workbook in place: removes columns in
+    'Data Sheet' that have no valid year in the P&L Report Date row and no
+    numeric data underneath. Returns the number of columns removed."""
+    if "Data Sheet" not in wb.sheetnames:
+        return 0
+    ws = wb["Data Sheet"]
+
+    pl_date_row = None
+    for i in range(1, 50):
+        val = ws.cell(i, 1).value
+        if val and "Report Date" in str(val):
+            pl_date_row = i
+            break
+    if not pl_date_row:
+        return 0
+
+    cols_to_delete = []
+    for col in range(2, ws.max_column + 1):
+        date_val = ws.cell(pl_date_row, col).value
+        has_valid_date = bool(date_val) and (
+            hasattr(date_val, "year") or re.search(r"20\d{2}", str(date_val))
+        )
+        if not has_valid_date:
+            cols_to_delete.append(col)
+            continue
+        sales_row = pl_date_row + 1
+        has_data = False
+        for check_row in range(sales_row, min(sales_row + 10, ws.max_row + 1)):
+            val = ws.cell(check_row, col).value
+            if val and val != 0:
+                try:
+                    float(val)
+                    has_data = True
+                    break
+                except (TypeError, ValueError):
+                    pass
+        if not has_data:
+            cols_to_delete.append(col)
+
+    for col in sorted(cols_to_delete, reverse=True):
+        ws.delete_cols(col)
+    return len(cols_to_delete)
+
+
+BS_TEMPLATE_ITEMS = [
+    "Equity Share Capital", "Reserves", "Borrowings", "Other Liabilities",
+    "Total",  # Total Liabilities (1st occurrence)
+    "Net Block", "Capital Work in Progress", "Investments", "Other Assets",
+    "Total",  # Total Assets (2nd occurrence)
+    "Receivables", "Inventory", "Cash & Bank",
+    "No. of Equity Shares", "New Bonus Shares", "Face value",
+]
+
+PL_TEMPLATE_ITEMS = [
+    "Sales", "Raw Material Cost", "Change in Inventory", "Power and Fuel",
+    "Other Mfr. Exp", "Employee Cost", "Selling and admin", "Other Expenses",
+    "Other Income", "Depreciation", "Interest", "Profit before tax", "Tax",
+    "Net profit", "Dividend Amount",
+]
+
+
+def convert_to_template(wb):
+    """Reshape the raw 'Data Sheet' (Screener's export format, everything in
+    one sheet with section headers) into a two-sheet workbook matching the
+    DCF-tool's expected input: 'Balance Sheet' and 'Profit and Loss Account',
+    each with a title row, a 'Report Date' header row, then one row per
+    template line item in a fixed order. Returns a new openpyxl Workbook, or
+    None if the Data Sheet doesn't look like a Screener export."""
+    if "Data Sheet" not in wb.sheetnames:
+        return None
+    src_ws = wb["Data Sheet"]
+
+    pl_date_row = None
+    bs_date_row = None
+    for i in range(1, 100):
+        val = src_ws.cell(i, 1).value
+        if not val:
+            continue
+        val_str = str(val).upper()
+        if pl_date_row is None and ("PROFIT" in val_str or "P&L" in val_str or "P & L" in val_str):
+            nxt = src_ws.cell(i + 1, 1).value
+            if nxt and "Report Date" in str(nxt):
+                pl_date_row = i + 1
+        elif bs_date_row is None and "BALANCE" in val_str:
+            nxt = src_ws.cell(i + 1, 1).value
+            if nxt and "Report Date" in str(nxt):
+                bs_date_row = i + 1
+    if not pl_date_row or not bs_date_row:
+        return None
+
+    first_data_col = None
+    for col in range(2, src_ws.max_column + 1):
+        if src_ws.cell(pl_date_row, col).value:
+            first_data_col = col
+            break
+    if not first_data_col:
+        return None
+
+    dates, date_cols = [], []
+    for col in range(first_data_col, src_ws.max_column + 1):
+        val = src_ws.cell(pl_date_row, col).value
+        if val:
+            dates.append(val)
+            date_cols.append(col)
+    if not dates:
+        return None
+
+    new_wb = Workbook()
+    new_wb.remove(new_wb.active)
+
+    def build_sheet(title_row_text, sheet_name, position, items, section_date_row, max_scan):
+        ws = new_wb.create_sheet(sheet_name, position)
+        ws["A1"] = title_row_text
+        ws["A2"] = "Report Date"
+        for idx, date_val in enumerate(dates, start=2):
+            ws.cell(2, idx).value = date_val
+        target_row = 3
+        total_count = 0
+        for item_name in items:
+            ws.cell(target_row, 1).value = item_name
+            for src_row in range(section_date_row + 1, min(section_date_row + max_scan, src_ws.max_row + 1)):
+                src_item = src_ws.cell(src_row, 1).value
+                if not src_item:
+                    continue
+                src_item_str = str(src_item).strip()
+                if item_name == "Total":
+                    if src_item_str == "Total":
+                        total_count += 1
+                        # 1st Total -> row 7 (Total Liabilities), 2nd -> row 12 (Total Assets)
+                        if (target_row == 7 and total_count == 1) or (target_row == 12 and total_count == 2):
+                            for idx, src_col in enumerate(date_cols, start=2):
+                                ws.cell(target_row, idx).value = src_ws.cell(src_row, src_col).value
+                            break
+                elif src_item_str == item_name:
+                    for idx, src_col in enumerate(date_cols, start=2):
+                        ws.cell(target_row, idx).value = src_ws.cell(src_row, src_col).value
+                    break
+            target_row += 1
+        return ws
+
+    build_sheet("BALANCE SHEET", "Balance Sheet", 0, BS_TEMPLATE_ITEMS, bs_date_row, 25)
+    build_sheet("PROFIT & LOSS", "Profit and Loss Account", 1, PL_TEMPLATE_ITEMS, pl_date_row, 30)
+    return new_wb
 
 
 # --------------------------------------------------------------------------- #
@@ -675,6 +885,59 @@ def single_company_mode(session, idx):
                 show["Date"] = show["Date"].dt.strftime("%d %b %Y")
                 st.dataframe(show[["Date", "Person / Entity", "Tag", "Action", "Quantity", "Price"]],
                              use_container_width=True, hide_index=True)
+
+    st.markdown("### Financials Excel Export")
+    with st.expander("📥 Download financials (Balance Sheet + P&L, template format)"):
+        st.caption(
+            "Pulls Screener's own 'Export to Excel' file for this company, strips "
+            "columns with no year data, then reshapes the raw Data Sheet into two "
+            "clean sheets — Balance Sheet and Profit and Loss Account — ready for "
+            "a DCF/DDM/RIM model. Everything happens in memory; nothing is written to disk."
+        )
+        if st.button("Fetch & convert", key="fetch_excel_btn"):
+            next_path = resolved["url"].replace(BASE, "")
+            with st.spinner("Downloading Excel export from screener.in ..."):
+                raw_bytes, err = download_company_excel(session, resolved["html"], resolved["url"], next_path)
+            if err:
+                st.error(err)
+            else:
+                from io import BytesIO
+                try:
+                    wb = load_workbook(BytesIO(raw_bytes))
+                except Exception as e:
+                    st.error(f"Downloaded file isn't a readable Excel workbook: {e}")
+                    wb = None
+                if wb is not None:
+                    removed = strip_empty_year_columns(wb)
+                    if removed:
+                        st.caption(f"Removed {removed} empty year column(s).")
+                    template_wb = convert_to_template(wb)
+                    if template_wb is None:
+                        st.warning(
+                            "Downloaded the raw export, but couldn't find a 'Data Sheet' with "
+                            "recognisable Balance Sheet / P&L sections to reshape into the template. "
+                            "Offering the raw export instead."
+                        )
+                        buf = BytesIO()
+                        wb.save(buf)
+                        buf.seek(0)
+                        st.download_button(
+                            "⬇️ Download raw Excel export",
+                            buf,
+                            file_name=f"{resolved['id_used']}_screener_raw.xlsx",
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        )
+                    else:
+                        buf = BytesIO()
+                        template_wb.save(buf)
+                        buf.seek(0)
+                        st.success("Converted to template format.")
+                        st.download_button(
+                            "⬇️ Download template Excel (Balance Sheet + P&L)",
+                            buf,
+                            file_name=f"{resolved['id_used']}_template.xlsx",
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        )
 
 
 def bulk_scan_mode(session, idx):
