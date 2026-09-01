@@ -154,19 +154,23 @@ def build_session(cookie_path: str | None, _bust: float = 0.0):
     return session, bool(cookie_dict)
 
 
-def check_login(session: requests.Session) -> tuple[bool, str]:
+def check_login(session: requests.Session) -> tuple[bool, str, str]:
+    """Returns (ok, message, reason) where reason is one of:
+    'ok', 'network', 'auth', 'http', 'unknown' - so callers can tell a
+    connectivity failure apart from an actual expired-cookie failure instead
+    of lumping both under generic cookie-refresh advice."""
     try:
         r = session.get(BASE + "/", timeout=15)
     except requests.RequestException as e:
-        return False, f"Could not reach screener.in ({e})"
+        return False, f"Could not reach screener.in ({e})", "network"
     if r.status_code != 200:
-        return False, f"Homepage returned HTTP {r.status_code}"
+        return False, f"Homepage returned HTTP {r.status_code}", "http"
     html = r.text
     if re.search(r'href="/logout/"', html) or "Logout" in html:
-        return True, "Logged in"
+        return True, "Logged in", "ok"
     if re.search(r'href="/login/\?[^"]*"', html) or re.search(r"Log ?in", html):
-        return False, "Cookies look expired / not logged in (login link visible)"
-    return False, "Couldn't confirm login state - proceeding cautiously"
+        return False, "Cookies look expired / not logged in (login link visible)", "auth"
+    return False, "Couldn't confirm login state - proceeding cautiously", "unknown"
 
 
 # --------------------------------------------------------------------------- #
@@ -262,15 +266,23 @@ def resolve_identifier_line(line: str, idx: pd.DataFrame):
 
 
 def fetch_url(session: requests.Session, url: str, delay: float = 0.0):
+    """Returns (html_or_None, final_url, reason). reason is 'ok' on success,
+    else a short human-readable explanation ('network error: ...', 'HTTP 404',
+    etc.) so callers can tell a real 404/no-such-view apart from a transient
+    connection failure instead of treating both as plain None."""
     if delay:
         time.sleep(delay)
     try:
         r = session.get(url, timeout=15)
-        if r.status_code != 200:
-            return None
-        return r.text
-    except requests.RequestException:
-        return None
+    except requests.RequestException as e:
+        return None, url, f"network error: {e}"
+    if r.status_code != 200:
+        return None, r.url, f"HTTP {r.status_code}"
+    # r.url is the final URL after any redirects - screener silently 302s
+    # /company/<id>/consolidated/ to the standalone page for companies with
+    # no consolidated financials, so this is the only reliable way to know
+    # which view we actually got back, rather than trusting the URL we asked for.
+    return r.text, r.url, "ok"
 
 
 def _has_shareholding_data(html: str, period: str = "quarterly") -> bool:
@@ -285,21 +297,54 @@ def _has_shareholding_data(html: str, period: str = "quarterly") -> bool:
 
 def resolve_company_full(session, nse_ticker, bse_code):
     """Single-company mode: try consolidated -> standalone, NSE -> BSE,
-    preferring the first with actual shareholding data."""
+    preferring the first with actual shareholding data. Makes exactly one
+    pass (no re-fetching), recording every attempt so the UI can show
+    exactly why a given view/identifier was chosen instead of it looking
+    arbitrary or - worse - looking arbitrary because a network hiccup
+    silently ate the consolidated attempt."""
     candidates = [c for c in [nse_ticker, bse_code] if c and str(c).lower() != "nan"]
+    attempts = []
+    fallback = None  # best "loaded but no shareholding table" result, used only if nothing better turns up
+
     for view in ["consolidated", ""]:
         for ident in candidates:
-            url = f"{BASE}/company/{ident}/" + (f"{view}/" if view else "")
-            html = fetch_url(session, url)
-            if html and _has_shareholding_data(html):
-                return {"html": html, "url": url, "id_used": ident, "view": view or "standalone"}
-    for view in ["consolidated", ""]:
-        for ident in candidates:
-            url = f"{BASE}/company/{ident}/" + (f"{view}/" if view else "")
-            html = fetch_url(session, url)
-            if html:
-                return {"html": html, "url": url, "id_used": ident,
-                        "view": (view or "standalone") + " (no shareholding data)"}
+            requested_url = f"{BASE}/company/{ident}/" + (f"{view}/" if view else "")
+            html, final_url, reason = fetch_url(session, requested_url)
+            if html is None:
+                attempts.append({
+                    "Identifier": ident, "Requested view": view or "standalone",
+                    "Result": f"failed - {reason}",
+                })
+                continue
+            # r.url after redirects is the only reliable way to know which
+            # view we actually got - screener silently 302s a requested
+            # ".../consolidated/" URL to the plain standalone page for
+            # companies with no consolidated financials.
+            actual_view = "consolidated" if "/consolidated/" in final_url else "standalone"
+            has_data = _has_shareholding_data(html)
+            attempts.append({
+                "Identifier": ident, "Requested view": view or "standalone",
+                "Result": (
+                    f"loaded, served as {actual_view}"
+                    + ("" if has_data else " (no shareholding table)")
+                    + (" [redirected]" if actual_view != (view or "standalone") else "")
+                ),
+            })
+            if has_data:
+                return {"html": html, "url": final_url, "id_used": ident,
+                        "view": actual_view, "attempts": attempts}
+            if fallback is None:
+                fallback = {"html": html, "url": final_url, "id_used": ident,
+                            "view": f"{actual_view} (no shareholding data)", "attempts": attempts}
+
+    if fallback:
+        fallback["attempts"] = attempts  # make sure it carries the full log, not just attempts-so-far
+        return fallback
+    if attempts and all(a["Result"].startswith("failed - network error") for a in attempts):
+        # Every single attempt was a connection failure, not a real 404/no-data
+        # response - this is a network outage, not "this company has no page".
+        return {"html": None, "url": None, "id_used": None, "view": None,
+                "attempts": attempts, "network_failure": True}
     return None
 
 
@@ -309,14 +354,14 @@ def resolve_company_light(session, nse_ticker, bse_code, delay: float = 0.0):
     candidates = [c for c in [nse_ticker, bse_code] if c and str(c).lower() != "nan"]
     for ident in candidates:
         url = f"{BASE}/company/{ident}/consolidated/"
-        html = fetch_url(session, url, delay=delay)
+        html, final_url, _reason = fetch_url(session, url, delay=delay)
         if html:
-            return html, url
+            return html, final_url
     for ident in candidates:
         url = f"{BASE}/company/{ident}/"
-        html = fetch_url(session, url, delay=delay)
+        html, final_url, _reason = fetch_url(session, url, delay=delay)
         if html:
-            return html, url
+            return html, final_url
     return None, None
 
 
@@ -694,7 +739,7 @@ def scan_one_company(session, name, nse_ticker, bse_code, cutoff, delay):
     if not trades_path:
         return {"name": name, "status": "no_trades_link", "deals": pd.DataFrame(), "url": url}
 
-    trades_html = fetch_url(session, BASE + trades_path, delay=delay)
+    trades_html, _trades_url, _reason = fetch_url(session, BASE + trades_path, delay=delay)
     if not trades_html:
         return {"name": name, "status": "trades_fetch_failed", "deals": pd.DataFrame(), "url": url}
 
@@ -790,15 +835,25 @@ def render_login_banner(session, cookie_path, has_cookies):
 
     if stale:
         with st.spinner("Checking login status..."):
-            ok, msg = check_login(session)
-        st.session_state[cache_key] = (ok, msg)
+            ok, msg, reason = check_login(session)
+        st.session_state[cache_key] = (ok, msg, reason)
         st.session_state[cache_ts_key] = now
     else:
-        ok, msg = st.session_state[cache_key]
+        ok, msg, reason = st.session_state[cache_key]
 
     with header_col:
         if ok:
             st.success(f"🔓 {msg} (`{os.path.basename(cookie_path)}`)")
+        elif reason == "network":
+            # A connection-level failure has nothing to do with cookies -
+            # telling someone to re-export cookies for a network outage
+            # sends them chasing the wrong fix.
+            st.error(
+                f"🔴 {msg} This is a network-connectivity failure, not a login "
+                "problem - re-exporting cookies won't fix it. If this persists "
+                "across scans (not just a one-off), your hosting platform's "
+                "outbound network likely can't reach screener.in at all right now."
+            )
         else:
             st.warning(f"⚠️ {msg}. Deals data may come back empty — re-export `cookies.pkl` if so.")
 
@@ -834,6 +889,15 @@ def single_company_mode(session, idx):
     if resolved is None:
         st.error("Couldn't reach screener.in for this company.")
         return
+    if resolved.get("network_failure"):
+        st.error(
+            "Every attempt to reach this company's page failed with a "
+            "connection error — this is a network-connectivity problem, not "
+            "an authentication issue. Re-exporting cookies won't fix it."
+        )
+        with st.expander("What was attempted"):
+            st.dataframe(pd.DataFrame(resolved["attempts"]), use_container_width=True, hide_index=True)
+        return
 
     company_name = parse_company_name(resolved["html"])
     st.subheader(company_name)
@@ -841,6 +905,14 @@ def single_company_mode(session, idx):
         f"Source: [{resolved['url']}]({resolved['url']})  •  view: **{resolved['view']}**  "
         f"•  identifier used: `{resolved['id_used']}`"
     )
+    with st.expander("Why this view? (consolidated/standalone resolution log)"):
+        st.dataframe(pd.DataFrame(resolved["attempts"]), use_container_width=True, hide_index=True)
+        st.caption(
+            "Screener silently redirects a requested `/consolidated/` URL to the "
+            "plain company page when a company has no consolidated financials — "
+            "that shows up here as '[redirected]', distinct from a network failure "
+            "that happened to hit the consolidated attempt."
+        )
 
     sh_header_col, sh_toggle_col = st.columns([3, 1])
     sh_header_col.markdown("### Shareholding Pattern")
@@ -882,9 +954,16 @@ def single_company_mode(session, idx):
         st.warning("No Trades link found for this company.")
         return
     with st.spinner("Fetching trades ..."):
-        trades_html = fetch_url(session, BASE + trades_path)
+        trades_html, _trades_url, trades_reason = fetch_url(session, BASE + trades_path)
     if not trades_html:
-        st.error("Could not fetch the Trades page.")
+        if trades_reason.startswith("network error"):
+            st.error(
+                f"Could not reach the Trades page — {trades_reason}. This is a "
+                "connectivity failure, not a login problem, so re-exporting "
+                "cookies won't help."
+            )
+        else:
+            st.error(f"Could not fetch the Trades page ({trades_reason}).")
         return
     if looks_login_gated(trades_html):
         st.error("Trades page looks login-gated — check your `cookies.pkl` is valid.")
