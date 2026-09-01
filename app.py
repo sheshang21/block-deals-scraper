@@ -27,6 +27,8 @@ import pandas as pd
 import requests
 import streamlit as st
 from bs4 import BeautifulSoup
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 # --------------------------------------------------------------------------- #
 # Constants
@@ -123,6 +125,18 @@ def build_session(cookie_path: str | None, _bust: float = 0.0):
     fresh session after the user uploads a new cookie file mid-run."""
     session = requests.Session()
     session.headers.update(HEADERS)
+    # Cloud egress to screener.in can be flaky (transient connection-refused /
+    # reset), so retry a few times with backoff before giving up, instead of
+    # failing the whole page load on one bad attempt.
+    retry = Retry(
+        total=3,
+        backoff_factor=0.6,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET"],
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
     cookie_dict = {}
     if cookie_path and os.path.exists(cookie_path):
         try:
@@ -258,11 +272,11 @@ def fetch_url(session: requests.Session, url: str, delay: float = 0.0):
         return None
 
 
-def _has_shareholding_data(html: str) -> bool:
+def _has_shareholding_data(html: str, period: str = "quarterly") -> bool:
     if not html:
         return False
     soup = BeautifulSoup(html, "html.parser")
-    table = soup.select_one("#quarterly-shp table")
+    table = soup.select_one(f"#{period}-shp table")
     if not table:
         return False
     return len(table.select("tbody tr")) > 0
@@ -331,9 +345,12 @@ ROW_LABELS = {"Promoters": "Promoters", "FIIs": "FIIs", "DIIs": "DIIs",
               "Government": "Government", "Public": "Public"}
 
 
-def parse_shareholding(html: str) -> pd.DataFrame:
+def parse_shareholding(html: str, period: str = "quarterly") -> pd.DataFrame:
+    """period: 'quarterly' or 'yearly' - both tables ship in the same page
+    load (screener toggles them client-side with a `hidden` class), so no
+    extra request is needed to switch views."""
     soup = BeautifulSoup(html, "html.parser")
-    table = soup.select_one("#quarterly-shp table")
+    table = soup.select_one(f"#{period}-shp table")
     if not table:
         return pd.DataFrame()
     headers = [th.get_text(strip=True) for th in table.select("thead th")][1:]
@@ -587,26 +604,36 @@ def single_company_mode(session, idx):
         f"•  identifier used: `{resolved['id_used']}`"
     )
 
-    sh_df = parse_shareholding(resolved["html"])
-    st.markdown("### Shareholding Pattern")
+    sh_header_col, sh_toggle_col = st.columns([3, 1])
+    sh_header_col.markdown("### Shareholding Pattern")
+    period_choice = sh_toggle_col.radio(
+        "Period", ["Quarterly", "Yearly"], horizontal=True,
+        label_visibility="collapsed", key="shp_period",
+    )
+    period = "quarterly" if period_choice == "Quarterly" else "yearly"
+
+    # Both the quarterly and yearly tables ship in the same page load
+    # (screener just toggles visibility client-side), so switching the
+    # radio re-parses already-fetched HTML - no extra network round trip.
+    sh_df = parse_shareholding(resolved["html"], period=period)
     if sh_df.empty:
-        st.warning("No shareholding pattern table found on this page.")
+        st.warning(f"No {period_choice.lower()} shareholding pattern table found on this page.")
     else:
-        quarters = list(sh_df.columns)
-        latest_q, prev_q = quarters[-1], (quarters[-2] if len(quarters) > 1 else None)
+        periods = list(sh_df.columns)
+        latest_p, prev_p = periods[-1], (periods[-2] if len(periods) > 1 else None)
         cat_order = [c for c in ["Promoters", "FIIs", "DIIs", "Government", "Public"] if c in sh_df.index]
         cols = st.columns(len(cat_order) + 1)
         for i, cat in enumerate(cat_order):
-            latest_val = pct_to_float(sh_df.loc[cat, latest_q])
-            prev_val = pct_to_float(sh_df.loc[cat, prev_q]) if prev_q else None
+            latest_val = pct_to_float(sh_df.loc[cat, latest_p])
+            prev_val = pct_to_float(sh_df.loc[cat, prev_p]) if prev_p else None
             delta = None if (latest_val is None or prev_val is None) else round(latest_val - prev_val, 2)
             cols[i].metric(cat, f"{latest_val:.2f}%" if latest_val is not None else "-",
                             f"{delta:+.2f} pp" if delta is not None else None)
         if "No. of Shareholders" in sh_df.index:
-            cols[-1].metric("No. of Shareholders", sh_df.loc["No. of Shareholders", latest_q])
+            cols[-1].metric("No. of Shareholders", sh_df.loc["No. of Shareholders", latest_p])
 
         trend = sh_df.loc[cat_order].T.apply(lambda col: col.map(pct_to_float))
-        st.caption("Quarter-on-quarter trend (%)")
+        st.caption(f"{period_choice} trend (%)")
         st.line_chart(trend)
         with st.expander("Full shareholding table"):
             st.dataframe(sh_df, use_container_width=True)
