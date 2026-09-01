@@ -126,18 +126,30 @@ def find_cookie_file() -> str | None:
 
 
 @st.cache_resource(show_spinner=False)
-def build_session(cookie_path: str | None, _bust: float = 0.0):
+def build_session(cookie_path: str | None, proxy_url: str | None = None, _bust: float = 0.0):
     """One shared authenticated requests.Session. `_bust` lets us force a
-    fresh session after the user uploads a new cookie file mid-run."""
+    fresh session after the user uploads a new cookie file mid-run.
+
+    `proxy_url` (e.g. "http://user:pass@host:port") routes ALL traffic
+    through that proxy - needed because screener.in refuses connections
+    from this deployment's cloud IP range directly (confirmed via network
+    diagnostics: DNS/TCP/TLS all work fine to other hosts, only screener.in
+    hard-refuses at the TCP level). A proxy with a non-datacenter exit IP
+    is the fix for that; nothing in the scraping/parsing code below can
+    substitute for it.
+    """
     session = requests.Session()
     session.headers.update(HEADERS)
     # Ignore any HTTP(S)_PROXY env vars the host might inject - a misconfigured
     # proxy can itself produce "connection refused"/reset errors that look
     # identical to a genuine egress block. This mirrors sheshvaluations'
     # screener_downloader.py, which disables trust_env for the same reason.
+    # We still explicitly set session.proxies below if the user supplied one.
     session.trust_env = False
     for var in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
         os.environ.pop(var, None)
+    if proxy_url:
+        session.proxies = {"http": proxy_url, "https": proxy_url}
     # Cloud egress to screener.in can be flaky (transient connection-refused /
     # reset), so retry a few times with backoff before giving up, instead of
     # failing the whole page load on one bad attempt.
@@ -185,7 +197,8 @@ def check_login(session: requests.Session) -> tuple[bool, str, str]:
     return False, "Couldn't confirm login state - proceeding cautiously", "unknown"
 
 
-def run_network_diagnostics(target_host: str = "www.screener.in", reference_host: str = "www.google.com"):
+def run_network_diagnostics(target_host: str = "www.screener.in", reference_host: str = "www.google.com",
+                             proxy_url: str | None = None):
     """Prints a full, step-by-step debug trace to the Streamlit page so a
     'Connection refused' can be told apart from DNS failure / TLS failure /
     proxy interference / auth, instead of one opaque exception string.
@@ -275,6 +288,24 @@ def run_network_diagnostics(target_host: str = "www.screener.in", reference_host
             with st.expander(f"Full traceback ({host})"):
                 st.code("".join(traceback.format_exception(type(e), e, e.__traceback__)))
 
+    if proxy_url:
+        st.markdown(f"#### Target via proxy: `{target_host}` through your configured proxy")
+        proxies = {"http": proxy_url, "https": proxy_url}
+        t0 = time.time()
+        try:
+            r = requests.get(f"https://{target_host}/", headers=HEADERS, timeout=20, proxies=proxies)
+            log(f"HTTPS GET / via proxy -> {r.status_code} in {time.time()-t0:.2f}s "
+                f"({len(r.content)} bytes, final URL {r.url})", "ok")
+            if r.status_code == 200 and ("Log in" in r.text or "/login/" in r.text) and "Logout" not in r.text:
+                log("Page loaded but looks logged-out - proxy works, check cookies next.", "info")
+        except Exception as e:
+            log(f"HTTPS GET / via proxy FAILED after {time.time()-t0:.2f}s: {type(e).__name__}: {e}", "fail")
+            with st.expander("Full traceback (via proxy)"):
+                st.code("".join(traceback.format_exception(type(e), e, e.__traceback__)))
+    else:
+        st.markdown("#### Target via proxy")
+        log("No proxy configured (set one in the sidebar) — this check is skipped.", "info")
+
     st.markdown("#### How to read this")
     st.markdown(
         "- **Reference host also fails at DNS/TCP** → outbound networking is broken for this "
@@ -285,6 +316,10 @@ def run_network_diagnostics(target_host: str = "www.screener.in", reference_host
         "is unreachable from this deployment's IP/region - could be the platform blocking that "
         "domain, or screener.in blocking that IP range (shared cloud IPs sometimes get rate-limited "
         "or blocklisted). Re-exporting cookies will not help either way.\n"
+        "- **Direct fails but 'via proxy' succeeds** → confirms it's an IP-range block on this "
+        "deployment specifically; keep the proxy configured and you're set.\n"
+        "- **Both direct and via-proxy fail** → try a different proxy/exit region, or double-check "
+        "the proxy URL and credentials.\n"
         "- **Both work here but the app still fails** → likely transient; the retry logic in "
         "`build_session()` should absorb one-off blips. If it keeps happening only during scans, "
         "it may be screener.in rate-limiting a shared outbound IP under load - try a lower worker "
@@ -975,7 +1010,7 @@ def render_login_banner(session, cookie_path, has_cookies):
             )
             if st.button("🔬 Run full network diagnostics", key="net_diag_btn"):
                 with st.spinner("Running DNS / TCP / TLS / HTTPS checks..."):
-                    run_network_diagnostics()
+                    run_network_diagnostics(proxy_url=st.session_state.get("proxy_url") or None)
         else:
             st.warning(f"⚠️ {msg}. Deals data may come back empty — re-export `cookies.pkl` if so.")
 
@@ -1284,7 +1319,21 @@ def main():
     st.title("📊 Screener.in Shareholding & Deals Scraper")
 
     cookie_path = find_cookie_file()
-    session, has_cookies = build_session(cookie_path)
+
+    # screener.in refuses direct connections from this deployment's cloud IP
+    # range (confirmed via network diagnostics - see sidebar). A proxy with
+    # a non-datacenter exit IP routes around that. Persist across reruns via
+    # session_state; changing it rebuilds the cached session automatically
+    # since it's part of build_session()'s cache key.
+    default_proxy = os.environ.get("SCREENER_PROXY_URL", "")
+    try:
+        default_proxy = st.secrets.get("SCREENER_PROXY_URL", default_proxy)
+    except Exception:
+        pass
+    if "proxy_url" not in st.session_state:
+        st.session_state["proxy_url"] = default_proxy
+
+    session, has_cookies = build_session(cookie_path, st.session_state["proxy_url"] or None)
     render_login_banner(session, cookie_path, has_cookies)
 
     with st.sidebar:
@@ -1305,13 +1354,39 @@ def main():
         mode = st.radio("Mode", ["🔎 Single Company", "📡 Bulk Scan – Recent Deals"])
 
         st.divider()
+        with st.expander("🌐 Proxy (screener.in blocks this host's IP)", expanded=not bool(st.session_state["proxy_url"])):
+            st.caption(
+                "Network diagnostics confirmed screener.in refuses connections "
+                "from this deployment's IP directly, while everything else "
+                "(DNS, other sites) works fine. A proxy with a non-datacenter "
+                "exit IP routes around that. Enter one below, e.g. "
+                "`http://user:pass@host:port`. You can also set it once via "
+                "the `SCREENER_PROXY_URL` env var / Streamlit secret instead "
+                "of typing it here every time."
+            )
+            proxy_input = st.text_input(
+                "Proxy URL", value=st.session_state["proxy_url"],
+                placeholder="http://user:pass@host:port", type="password",
+                key="proxy_url_input",
+            )
+            if proxy_input != st.session_state["proxy_url"]:
+                st.session_state["proxy_url"] = proxy_input
+                st.cache_resource.clear()
+                st.rerun()
+            if st.session_state["proxy_url"]:
+                st.caption("✅ Proxy set — requests to screener.in will route through it.")
+            else:
+                st.caption("⚠️ No proxy set — requests go direct and will likely be refused.")
+
+        st.divider()
         with st.expander("🔬 Network diagnostics (debug)"):
             st.caption(
-                "DNS → raw TCP → TLS → HTTPS, against screener.in and a "
-                "known-good reference site, with full tracebacks."
+                "DNS → raw TCP → TLS → HTTPS, against screener.in (direct AND "
+                "via your proxy if set) and a known-good reference site, with "
+                "full tracebacks."
             )
             if st.button("Run diagnostics", key="net_diag_sidebar_btn"):
-                run_network_diagnostics()
+                run_network_diagnostics(proxy_url=st.session_state["proxy_url"] or None)
 
     idx = build_search_index()
     if mode == "🔎 Single Company":
