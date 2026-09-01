@@ -18,8 +18,13 @@ Run with:  streamlit run app.py
 
 import os
 import pickle
+import platform
 import re
+import socket
+import ssl
+import sys
 import time
+import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 
@@ -126,6 +131,13 @@ def build_session(cookie_path: str | None, _bust: float = 0.0):
     fresh session after the user uploads a new cookie file mid-run."""
     session = requests.Session()
     session.headers.update(HEADERS)
+    # Ignore any HTTP(S)_PROXY env vars the host might inject - a misconfigured
+    # proxy can itself produce "connection refused"/reset errors that look
+    # identical to a genuine egress block. This mirrors sheshvaluations'
+    # screener_downloader.py, which disables trust_env for the same reason.
+    session.trust_env = False
+    for var in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
+        os.environ.pop(var, None)
     # Cloud egress to screener.in can be flaky (transient connection-refused /
     # reset), so retry a few times with backoff before giving up, instead of
     # failing the whole page load on one bad attempt.
@@ -171,6 +183,113 @@ def check_login(session: requests.Session) -> tuple[bool, str, str]:
     if re.search(r'href="/login/\?[^"]*"', html) or re.search(r"Log ?in", html):
         return False, "Cookies look expired / not logged in (login link visible)", "auth"
     return False, "Couldn't confirm login state - proceeding cautiously", "unknown"
+
+
+def run_network_diagnostics(target_host: str = "www.screener.in", reference_host: str = "www.google.com"):
+    """Prints a full, step-by-step debug trace to the Streamlit page so a
+    'Connection refused' can be told apart from DNS failure / TLS failure /
+    proxy interference / auth, instead of one opaque exception string.
+
+    Runs, in order, against BOTH `target_host` (screener.in) and a
+    `reference_host` known to be reachable from almost anywhere. If the
+    reference host also fails, the problem is outbound networking in
+    general (host/platform level) - not anything specific to screener.in,
+    and not fixable by changing scraping code at all.
+    """
+    def log(msg, kind="text"):
+        if kind == "ok":
+            st.markdown(f"✅ {msg}")
+        elif kind == "fail":
+            st.markdown(f"❌ {msg}")
+        elif kind == "info":
+            st.markdown(f"ℹ️ {msg}")
+        else:
+            st.text(msg)
+
+    st.markdown("#### Environment")
+    log(f"Python {sys.version.split()[0]} on {platform.platform()}")
+    proxy_vars = {k: v for k, v in os.environ.items()
+                  if k.upper() in ("HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "ALL_PROXY")}
+    if proxy_vars:
+        log(f"Proxy env vars set: {proxy_vars}", "info")
+    else:
+        log("No proxy env vars set (HTTP_PROXY / HTTPS_PROXY / NO_PROXY / ALL_PROXY)", "info")
+    try:
+        log(f"Outbound hostname/local IP hint: {socket.gethostname()}", "info")
+    except Exception as e:
+        log(f"Could not read local hostname: {e}", "info")
+
+    for label, host in [("Target (screener.in)", target_host), ("Reference (known-good site)", reference_host)]:
+        st.markdown(f"#### {label}: `{host}`")
+
+        # Step 1: DNS resolution
+        t0 = time.time()
+        try:
+            addrs = socket.getaddrinfo(host, 443, proto=socket.IPPROTO_TCP)
+            ips = sorted({a[4][0] for a in addrs})
+            log(f"DNS resolved in {time.time()-t0:.2f}s -> {', '.join(ips)}", "ok")
+        except Exception as e:
+            log(f"DNS resolution FAILED after {time.time()-t0:.2f}s: {type(e).__name__}: {e}", "fail")
+            log("DNS failure means this environment can't even look up the hostname - "
+                "that's a platform/DNS-resolver issue, not a cookies or scraping-code issue.", "info")
+            continue  # can't test further steps without an IP
+
+        # Step 2: raw TCP connect (bypasses requests/urllib3/proxies entirely)
+        connect_ip = ips[0]
+        t0 = time.time()
+        try:
+            with socket.create_connection((connect_ip, 443), timeout=8) as sock:
+                log(f"TCP connect to {connect_ip}:443 succeeded in {time.time()-t0:.2f}s", "ok")
+                tcp_ok = True
+        except Exception as e:
+            log(f"TCP connect to {connect_ip}:443 FAILED after {time.time()-t0:.2f}s: "
+                f"{type(e).__name__}: {e}", "fail")
+            tcp_ok = False
+            if isinstance(e, ConnectionRefusedError) or "Errno 111" in str(e) or "refused" in str(e).lower():
+                log(f"'Connection refused' at the raw-socket level means the OS got a response "
+                    f"(from {connect_ip} or a middlebox) actively rejecting the connection, before "
+                    f"any HTTP/TLS/cookie code even runs. No amount of `requests`/BeautifulSoup "
+                    f"scraping logic - from this app or from sheshvaluations - touches this layer, "
+                    f"so swapping that code cannot fix this specific error.", "info")
+
+        # Step 3: TLS handshake (only meaningful if TCP connect worked)
+        if tcp_ok:
+            t0 = time.time()
+            try:
+                ctx = ssl.create_default_context()
+                with socket.create_connection((connect_ip, 443), timeout=8) as sock:
+                    with ctx.wrap_socket(sock, server_hostname=host) as tls_sock:
+                        log(f"TLS handshake succeeded in {time.time()-t0:.2f}s "
+                            f"({tls_sock.version()}, cert CN/SAN verified for {host})", "ok")
+            except Exception as e:
+                log(f"TLS handshake FAILED after {time.time()-t0:.2f}s: {type(e).__name__}: {e}", "fail")
+
+        # Step 4: actual HTTP(S) GET via requests, exactly like the app does
+        t0 = time.time()
+        try:
+            r = requests.get(f"https://{host}/", headers=HEADERS, timeout=15)
+            log(f"HTTPS GET / -> {r.status_code} in {time.time()-t0:.2f}s "
+                f"({len(r.content)} bytes, final URL {r.url})", "ok")
+        except Exception as e:
+            log(f"HTTPS GET / FAILED after {time.time()-t0:.2f}s: {type(e).__name__}: {e}", "fail")
+            with st.expander(f"Full traceback ({host})"):
+                st.code("".join(traceback.format_exception(type(e), e, e.__traceback__)))
+
+    st.markdown("#### How to read this")
+    st.markdown(
+        "- **Reference host also fails at DNS/TCP** → outbound networking is broken for this "
+        "deployment in general (platform egress block, no internet egress enabled, sandboxed "
+        "container, etc). Nothing in `app.py` can fix this - check your hosting platform's "
+        "network/egress settings, or redeploy somewhere with unrestricted outbound access.\n"
+        "- **Reference host works, screener.in fails at DNS/TCP** → screener.in specifically "
+        "is unreachable from this deployment's IP/region - could be the platform blocking that "
+        "domain, or screener.in blocking that IP range (shared cloud IPs sometimes get rate-limited "
+        "or blocklisted). Re-exporting cookies will not help either way.\n"
+        "- **Both work here but the app still fails** → likely transient; the retry logic in "
+        "`build_session()` should absorb one-off blips. If it keeps happening only during scans, "
+        "it may be screener.in rate-limiting a shared outbound IP under load - try a lower worker "
+        "count / longer per-request delay in Bulk Scan mode."
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -854,6 +973,9 @@ def render_login_banner(session, cookie_path, has_cookies):
                 "across scans (not just a one-off), your hosting platform's "
                 "outbound network likely can't reach screener.in at all right now."
             )
+            if st.button("🔬 Run full network diagnostics", key="net_diag_btn"):
+                with st.spinner("Running DNS / TCP / TLS / HTTPS checks..."):
+                    run_network_diagnostics()
         else:
             st.warning(f"⚠️ {msg}. Deals data may come back empty — re-export `cookies.pkl` if so.")
 
@@ -1181,6 +1303,15 @@ def main():
 
         st.divider()
         mode = st.radio("Mode", ["🔎 Single Company", "📡 Bulk Scan – Recent Deals"])
+
+        st.divider()
+        with st.expander("🔬 Network diagnostics (debug)"):
+            st.caption(
+                "DNS → raw TCP → TLS → HTTPS, against screener.in and a "
+                "known-good reference site, with full tracebacks."
+            )
+            if st.button("Run diagnostics", key="net_diag_sidebar_btn"):
+                run_network_diagnostics()
 
     idx = build_search_index()
     if mode == "🔎 Single Company":
