@@ -34,7 +34,7 @@ from bs4 import BeautifulSoup
 
 BASE = "https://www.screener.in"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
-DATA_DIR = os.path.join(APP_DIR, "data")
+DATA_DIR = APP_DIR
 NSE_CSV = os.path.join(DATA_DIR, "NSE_Tickers_List.csv")
 BSE_CSV = os.path.join(DATA_DIR, "BSE_Codes_List.csv")
 
