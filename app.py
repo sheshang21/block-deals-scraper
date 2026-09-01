@@ -1,22 +1,26 @@
 """
 Screener.in Shareholding & Deals Scraper
 =========================================
-A Streamlit app that looks up a company (by name / NSE ticker / BSE code),
-pulls its Screener.in page (consolidated -> falls back to standalone if the
-consolidated view is blank), and shows:
+Two modes:
 
-  1. Current shareholding pattern (Promoters / FII / DII / Govt / Public) +
-     quarter-on-quarter trend.
-  2. Recent Block Deals, Bulk Deals and Insider Trades (from Screener's
-     "Trades" modal), with a heuristic FII/DII/Other tag on each
-     counterparty and a net-buy/sell summary for the selected window.
+  1. Single Company  - shareholding split (FII/DII/Promoter/Public) + trend,
+     and that company's Block/Bulk/Insider deals.
+  2. Bulk Scan       - scan many companies at once (paste a list, upload a
+     watchlist CSV, or use the full bundled NSE/BSE universe) and pull only
+     the Block/Bulk deals that happened in the last N days (default: 3).
+
+Screener.in gates the "Trades" modal behind login, so this app authenticates
+using a cookie jar exported from a logged-in browser session
+(`cookies.pkl` in the repo root - see README).
 
 Run with:  streamlit run app.py
 """
 
 import os
+import pickle
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 
 import pandas as pd
@@ -29,9 +33,17 @@ from bs4 import BeautifulSoup
 # --------------------------------------------------------------------------- #
 
 BASE = "https://www.screener.in"
-DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR = os.path.join(APP_DIR, "data")
 NSE_CSV = os.path.join(DATA_DIR, "NSE_Tickers_List.csv")
 BSE_CSV = os.path.join(DATA_DIR, "BSE_Codes_List.csv")
+
+# Any of these (checked in order) will be used as the cookie jar.
+COOKIE_CANDIDATES = [
+    os.path.join(APP_DIR, "cookies.pkl"),
+    os.path.join(APP_DIR, "screener_cookies.pkl"),
+    os.path.join(APP_DIR, "data", "cookies.pkl"),
+]
 
 HEADERS = {
     "User-Agent": (
@@ -39,11 +51,9 @@ HEADERS = {
         "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
     ),
     "Accept-Language": "en-US,en;q=0.9",
+    "Referer": BASE + "/",
 }
 
-# Very rough heuristics for tagging a counterparty as FII / DII / Other.
-# Screener doesn't label these directly, so this is a best-effort guess
-# based on common name patterns -- always eyeball the raw name too.
 FII_HINTS = [
     "mauritius", "singapore", "luxembourg", "ireland", "cayman", "fpi",
     "foreign", "overseas", "ishares", "vanguard", "blackrock", "jpmorgan",
@@ -75,6 +85,76 @@ DEAL_TABS = {
 }
 
 # --------------------------------------------------------------------------- #
+# Auth / session
+# --------------------------------------------------------------------------- #
+
+
+def _cookie_obj_to_dict(obj) -> dict:
+    """Normalise whatever shape the pickle is in (plain dict, Selenium-style
+    list of {"name","value"} dicts, or a requests/http.cookiejar jar) into a
+    simple {name: value} dict."""
+    if isinstance(obj, dict):
+        return {str(k): str(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        out = {}
+        for item in obj:
+            if isinstance(item, dict) and "name" in item and "value" in item:
+                out[item["name"]] = item["value"]
+        return out
+    # requests.cookies.RequestsCookieJar / http.cookiejar.CookieJar
+    if hasattr(obj, "get_dict"):
+        return obj.get_dict()
+    try:
+        return dict(obj)
+    except (TypeError, ValueError):
+        return {}
+
+
+def find_cookie_file() -> str | None:
+    for path in COOKIE_CANDIDATES:
+        if os.path.exists(path):
+            return path
+    return None
+
+
+@st.cache_resource(show_spinner=False)
+def build_session(cookie_path: str | None, _bust: float = 0.0):
+    """One shared authenticated requests.Session. `_bust` lets us force a
+    fresh session after the user uploads a new cookie file mid-run."""
+    session = requests.Session()
+    session.headers.update(HEADERS)
+    cookie_dict = {}
+    if cookie_path and os.path.exists(cookie_path):
+        try:
+            with open(cookie_path, "rb") as f:
+                cookie_dict = _cookie_obj_to_dict(pickle.load(f))
+            for name, value in cookie_dict.items():
+                # single domain only - setting the same cookie under both
+                # "www.screener.in" and ".screener.in" creates a duplicate
+                # that raises CookieConflictError the moment anything reads
+                # session.cookies as a plain dict (dict(), .get_dict(), etc).
+                session.cookies.set(name, value, domain=".screener.in")
+        except Exception:
+            cookie_dict = {}
+    return session, bool(cookie_dict)
+
+
+def check_login(session: requests.Session) -> tuple[bool, str]:
+    try:
+        r = session.get(BASE + "/", timeout=15)
+    except requests.RequestException as e:
+        return False, f"Could not reach screener.in ({e})"
+    if r.status_code != 200:
+        return False, f"Homepage returned HTTP {r.status_code}"
+    html = r.text
+    if re.search(r'href="/logout/"', html) or "Logout" in html:
+        return True, "Logged in"
+    if re.search(r'href="/login/\?[^"]*"', html) or re.search(r"Log ?in", html):
+        return False, "Cookies look expired / not logged in (login link visible)"
+    return False, "Couldn't confirm login state - proceeding cautiously"
+
+
+# --------------------------------------------------------------------------- #
 # Ticker / company lookup
 # --------------------------------------------------------------------------- #
 
@@ -98,8 +178,6 @@ def _norm(name: str) -> str:
 
 @st.cache_data(show_spinner=False)
 def build_search_index():
-    """Outer-merge NSE and BSE lists on a normalised company name so a
-    single search box can surface both identifiers when available."""
     nse, bse = load_ticker_lists()
     nse = nse.copy()
     bse = bse.copy()
@@ -132,7 +210,6 @@ def search_companies(query: str, limit: int = 25) -> pd.DataFrame:
         | idx["_key"].str.contains(re.escape(qn), na=False)
     )
     hits = idx[mask].copy()
-    # rank exact / startswith matches first
     hits["_rank"] = hits["Display Name"].str.upper().apply(
         lambda n: 0 if n == q else (1 if n.startswith(q) else 2)
     )
@@ -140,15 +217,40 @@ def search_companies(query: str, limit: int = 25) -> pd.DataFrame:
     return hits.drop(columns=["_rank"])
 
 
+def resolve_identifier_line(line: str, idx: pd.DataFrame):
+    """For bulk paste/CSV input: turn a free-text line (name, NSE ticker or
+    BSE code) into (display_name, nse_ticker, bse_code) or None."""
+    raw = line.strip()
+    if not raw:
+        return None
+    key = _norm(raw)
+    exact = idx[idx["_key"] == key]
+    if not exact.empty:
+        row = exact.iloc[0]
+        return row["Display Name"], row.get("NSE Ticker"), row.get("BSE Code")
+    exact_ticker = idx[idx["NSE Ticker"].astype(str).str.upper() == raw.upper()]
+    if not exact_ticker.empty:
+        row = exact_ticker.iloc[0]
+        return row["Display Name"], row.get("NSE Ticker"), row.get("BSE Code")
+    exact_bse = idx[idx["BSE Code"].astype(str) == raw]
+    if not exact_bse.empty:
+        row = exact_bse.iloc[0]
+        return row["Display Name"], row.get("NSE Ticker"), row.get("BSE Code")
+    # fall back: treat the raw text itself as an identifier screener might
+    # accept directly (covers tickers/codes not present in our CSVs)
+    return raw, raw, None
+
+
 # --------------------------------------------------------------------------- #
 # Screener page fetching
 # --------------------------------------------------------------------------- #
 
 
-@st.cache_data(show_spinner=False, ttl=3600)
-def fetch_url(url: str):
+def fetch_url(session: requests.Session, url: str, delay: float = 0.0):
+    if delay:
+        time.sleep(delay)
     try:
-        r = requests.get(url, headers=HEADERS, timeout=15)
+        r = session.get(url, timeout=15)
         if r.status_code != 200:
             return None
         return r.text
@@ -163,34 +265,44 @@ def _has_shareholding_data(html: str) -> bool:
     table = soup.select_one("#quarterly-shp table")
     if not table:
         return False
-    rows = table.select("tbody tr")
-    return len(rows) > 0
+    return len(table.select("tbody tr")) > 0
 
 
-def resolve_company(nse_ticker: str | None, bse_code: str | None):
-    """Try consolidated first, then standalone; try NSE id before BSE id.
-    Returns dict with html, url, id_used, view_used -- or None if nothing
-    worked."""
-    candidates = []
-    for ident in [nse_ticker, bse_code]:
-        if not ident or str(ident).lower() == "nan":
-            continue
-        candidates.append(ident)
-
+def resolve_company_full(session, nse_ticker, bse_code):
+    """Single-company mode: try consolidated -> standalone, NSE -> BSE,
+    preferring the first with actual shareholding data."""
+    candidates = [c for c in [nse_ticker, bse_code] if c and str(c).lower() != "nan"]
     for view in ["consolidated", ""]:
         for ident in candidates:
             url = f"{BASE}/company/{ident}/" + (f"{view}/" if view else "")
-            html = fetch_url(url)
+            html = fetch_url(session, url)
             if html and _has_shareholding_data(html):
                 return {"html": html, "url": url, "id_used": ident, "view": view or "standalone"}
-    # last resort: return whatever loaded even if shareholding table is empty
     for view in ["consolidated", ""]:
         for ident in candidates:
             url = f"{BASE}/company/{ident}/" + (f"{view}/" if view else "")
-            html = fetch_url(url)
+            html = fetch_url(session, url)
             if html:
-                return {"html": html, "url": url, "id_used": ident, "view": (view or "standalone") + " (no shareholding data)"}
+                return {"html": html, "url": url, "id_used": ident,
+                        "view": (view or "standalone") + " (no shareholding data)"}
     return None
+
+
+def resolve_company_light(session, nse_ticker, bse_code, delay: float = 0.0):
+    """Bulk-scan mode: just need ONE page that loads and exposes the Trades
+    link - skip the shareholding-emptiness check to save a request."""
+    candidates = [c for c in [nse_ticker, bse_code] if c and str(c).lower() != "nan"]
+    for ident in candidates:
+        url = f"{BASE}/company/{ident}/consolidated/"
+        html = fetch_url(session, url, delay=delay)
+        if html:
+            return html, url
+    for ident in candidates:
+        url = f"{BASE}/company/{ident}/"
+        html = fetch_url(session, url, delay=delay)
+        if html:
+            return html, url
+    return None, None
 
 
 def parse_company_name(html: str) -> str:
@@ -215,13 +327,8 @@ def parse_trades_url(html: str) -> str | None:
 # Shareholding pattern parsing
 # --------------------------------------------------------------------------- #
 
-ROW_LABELS = {
-    "Promoters": "Promoters",
-    "FIIs": "FIIs",
-    "DIIs": "DIIs",
-    "Government": "Government",
-    "Public": "Public",
-}
+ROW_LABELS = {"Promoters": "Promoters", "FIIs": "FIIs", "DIIs": "DIIs",
+              "Government": "Government", "Public": "Public"}
 
 
 def parse_shareholding(html: str) -> pd.DataFrame:
@@ -229,9 +336,7 @@ def parse_shareholding(html: str) -> pd.DataFrame:
     table = soup.select_one("#quarterly-shp table")
     if not table:
         return pd.DataFrame()
-
     headers = [th.get_text(strip=True) for th in table.select("thead th")][1:]
-
     records = {}
     shareholder_counts = None
     for tr in table.select("tbody tr"):
@@ -241,7 +346,6 @@ def parse_shareholding(html: str) -> pd.DataFrame:
         label_text = label_cell.get_text(" ", strip=True)
         cells = tr.find_all("td")[1:]
         values = [c.get_text(strip=True) for c in cells]
-
         matched = None
         for key in ROW_LABELS:
             if label_text.startswith(key):
@@ -251,10 +355,8 @@ def parse_shareholding(html: str) -> pd.DataFrame:
             records[matched] = values
         elif "No. of Shareholders" in label_text:
             shareholder_counts = values
-
     if not records:
         return pd.DataFrame()
-
     df = pd.DataFrame(records, index=headers[: len(next(iter(records.values())))]).T
     df.columns = headers[: df.shape[1]]
     if shareholder_counts:
@@ -277,9 +379,7 @@ def pct_to_float(x):
 def _clean_number(x: str):
     x = x.replace(",", "").strip()
     try:
-        if "." in x:
-            return float(x)
-        return int(x)
+        return float(x) if "." in x else int(x)
     except ValueError:
         return None
 
@@ -299,7 +399,6 @@ def parse_block_or_bulk(html: str, tab_id: str) -> pd.DataFrame:
     table = container.select_one("table")
     if not table:
         return pd.DataFrame()
-
     rows = []
     current_date = None
     for tr in table.select("tbody tr"):
@@ -310,77 +409,27 @@ def parse_block_or_bulk(html: str, tab_id: str) -> pd.DataFrame:
         tds = tr.find_all("td")
         if len(tds) < 4:
             continue
-        person = tds[0].get_text(" ", strip=True)
-        action = tds[1].get_text(strip=True)
-        qty = _clean_number(tds[2].get_text(strip=True))
-        price = _clean_number(tds[3].get_text(strip=True))
-        rows.append(
-            {
-                "Date": current_date,
-                "Person / Entity": person,
-                "Action": action,
-                "Quantity": qty,
-                "Price": price,
-            }
-        )
+        rows.append({
+            "Date": current_date,
+            "Person / Entity": tds[0].get_text(" ", strip=True),
+            "Action": tds[1].get_text(strip=True),
+            "Quantity": _clean_number(tds[2].get_text(strip=True)),
+            "Price": _clean_number(tds[3].get_text(strip=True)),
+        })
     df = pd.DataFrame(rows)
     if not df.empty:
         df = df.dropna(subset=["Date"])
     return df
 
 
-def parse_insider(html: str) -> pd.DataFrame:
+def looks_login_gated(html: str) -> bool:
+    """Heuristic: trades page loaded but the tab containers are missing
+    entirely, which is what we'd expect if the Trades modal content itself
+    requires auth and we're not authenticated."""
+    if not html:
+        return True
     soup = BeautifulSoup(html, "html.parser")
-    container = soup.select_one(f"#{DEAL_TABS['insider']}")
-    if not container:
-        return pd.DataFrame()
-    table = container.select_one("table")
-    if not table:
-        return pd.DataFrame()
-
-    rows = []
-    current_date = None
-    for tr in table.select("tbody tr"):
-        strong = tr.select_one("td.text.strong.sub")
-        if strong is not None:
-            # Insider table dates are "Sep 2025" style (month/year only)
-            try:
-                current_date = datetime.strptime(strong.get_text(strip=True), "%b %Y")
-            except ValueError:
-                current_date = None
-            continue
-        tds = tr.find_all("td")
-        if len(tds) < 3:
-            continue
-        person_cell = tds[0]
-        person = person_cell.get_text(" ", strip=True)
-        role_span = person_cell.select_one("span")
-        role = role_span.get_text(strip=True) if role_span else ""
-        # remaining cells: [maybe qty, avg price, value] -- qty cell may be absent
-        rest = [t.get_text(strip=True) for t in tds[1:]]
-        qty = _clean_number(rest[0]) if len(rest) >= 3 else (
-            _clean_number(rest[0]) if len(rest) >= 1 else None
-        )
-        avg_price = _clean_number(rest[-2]) if len(rest) >= 2 else None
-        value = _clean_number(rest[-1]) if len(rest) >= 1 else None
-        direction = "Buy" if "up" in (tds[1].get("class") or []) else (
-            "Sell" if "down" in (tds[1].get("class") or []) else ""
-        )
-        rows.append(
-            {
-                "Month": current_date,
-                "Person": person.replace(role, "").strip(),
-                "Role": role,
-                "Direction": direction,
-                "Quantity": qty,
-                "Avg Price": avg_price,
-                "Value (Rs. Lacs)": value,
-            }
-        )
-    df = pd.DataFrame(rows)
-    if not df.empty:
-        df = df.dropna(subset=["Month"])
-    return df
+    return not any(soup.select_one(f"#{tid}") for tid in DEAL_TABS.values())
 
 
 def classify_investor(name: str) -> str:
@@ -404,63 +453,132 @@ def normalise_action(a: str) -> str:
 
 
 # --------------------------------------------------------------------------- #
+# Bulk scan engine
+# --------------------------------------------------------------------------- #
+
+
+def scan_one_company(session, name, nse_ticker, bse_code, cutoff, delay):
+    """Runs in a worker thread. Returns a dict describing what happened."""
+    html, url = resolve_company_light(session, nse_ticker, bse_code, delay=delay)
+    if not html:
+        return {"name": name, "status": "fetch_failed", "deals": pd.DataFrame(), "url": url}
+
+    trades_path = parse_trades_url(html)
+    if not trades_path:
+        return {"name": name, "status": "no_trades_link", "deals": pd.DataFrame(), "url": url}
+
+    trades_html = fetch_url(session, BASE + trades_path, delay=delay)
+    if not trades_html:
+        return {"name": name, "status": "trades_fetch_failed", "deals": pd.DataFrame(), "url": url}
+
+    if looks_login_gated(trades_html):
+        return {"name": name, "status": "login_required", "deals": pd.DataFrame(), "url": url}
+
+    block_df = parse_block_or_bulk(trades_html, DEAL_TABS["block"])
+    bulk_df = parse_block_or_bulk(trades_html, DEAL_TABS["bulk"])
+    for df, kind in ((block_df, "Block"), (bulk_df, "Bulk")):
+        if not df.empty:
+            df["Deal Type"] = kind
+
+    combined = pd.concat([block_df, bulk_df], ignore_index=True) if not (block_df.empty and bulk_df.empty) else pd.DataFrame()
+    if combined.empty:
+        return {"name": name, "status": "ok_no_deals", "deals": pd.DataFrame(), "url": url}
+
+    recent = combined[combined["Date"] >= cutoff].copy()
+    if recent.empty:
+        return {"name": name, "status": "ok_no_recent_deals", "deals": pd.DataFrame(), "url": url}
+
+    recent["Company"] = name
+    recent["Action"] = recent["Action"].map(normalise_action)
+    recent["Tag"] = recent["Person / Entity"].map(classify_investor)
+    return {"name": name, "status": "ok_deals_found", "deals": recent, "url": url}
+
+
+def run_bulk_scan(session, companies, window_days, max_workers, delay, progress_cb=None):
+    """companies: list of (name, nse_ticker, bse_code). Returns
+    (all_deals_df, status_counts dict, per_company_log list)."""
+    cutoff = datetime.now() - timedelta(days=window_days)
+    all_deals = []
+    status_counts = {}
+    log = []
+    total = len(companies)
+    done = 0
+
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = {
+            pool.submit(scan_one_company, session, name, nse, bse, cutoff, delay): name
+            for name, nse, bse in companies
+        }
+        for fut in as_completed(futures):
+            done += 1
+            try:
+                result = fut.result()
+            except Exception as e:
+                result = {"name": futures[fut], "status": f"error: {e}", "deals": pd.DataFrame(), "url": None}
+            status_counts[result["status"]] = status_counts.get(result["status"], 0) + 1
+            log.append({"Company": result["name"], "Status": result["status"], "URL": result.get("url")})
+            if not result["deals"].empty:
+                all_deals.append(result["deals"])
+            if progress_cb:
+                progress_cb(done, total, result)
+
+    deals_df = pd.concat(all_deals, ignore_index=True) if all_deals else pd.DataFrame()
+    return deals_df, status_counts, log
+
+
+# --------------------------------------------------------------------------- #
 # Streamlit UI
 # --------------------------------------------------------------------------- #
 
 
-def main():
-    st.set_page_config(page_title="Screener FII/DII & Block Deal Scraper", layout="wide")
-    st.title("📊 Screener.in Shareholding & Deals Scraper")
-    st.caption(
-        "Looks up a company on screener.in, prefers the consolidated view and falls "
-        "back to standalone when consolidated is blank. Pulls the current FII/DII/"
-        "Promoter/Public shareholding split plus recent Block Deals, Bulk Deals and "
-        "Insider Trades."
+def render_login_banner(session, cookie_path, has_cookies):
+    if not has_cookies:
+        st.error(
+            "No `cookies.pkl` found in the app folder. Screener.in's Trades modal "
+            "needs a logged-in session, so Block/Bulk deal data will likely come "
+            "back empty. Export cookies (`csrftoken` + `sessionid`) from a logged-in "
+            "browser session and save them as `cookies.pkl` next to `app.py`."
+        )
+        return
+    with st.spinner("Checking login status..."):
+        ok, msg = check_login(session)
+    if ok:
+        st.success(f"🔓 {msg} (`{os.path.basename(cookie_path)}`)")
+    else:
+        st.warning(f"⚠️ {msg}. Deals data may come back empty — re-export `cookies.pkl` if so.")
+
+
+def single_company_mode(session, idx):
+    query = st.text_input("Search by name, NSE ticker or BSE code", value="RELIANCE")
+    results = search_companies(query) if query else pd.DataFrame()
+    if results.empty:
+        st.info("Type a company name, NSE ticker (e.g. RELIANCE) or BSE code (e.g. 500325).")
+        return
+
+    options = []
+    for _, r in results.iterrows():
+        bits = []
+        if pd.notna(r.get("NSE Ticker")):
+            bits.append(f"NSE:{r['NSE Ticker']}")
+        if pd.notna(r.get("BSE Code")):
+            bits.append(f"BSE:{r['BSE Code']}")
+        options.append(f"{r['Display Name']}  ({', '.join(bits)})")
+    choice = st.selectbox("Matches", options, index=0)
+    row = results.iloc[options.index(choice)]
+
+    window_days = st.slider("Deals window (days)", 1, 730, 3, step=1, key="single_window")
+
+    nse_ticker = None if pd.isna(row.get("NSE Ticker")) else str(row["NSE Ticker"])
+    bse_code = row.get("BSE Code")
+    bse_code = None if pd.isna(bse_code) else (
+        str(int(float(bse_code))) if str(bse_code).replace(".", "").isdigit() else str(bse_code)
     )
 
-    with st.sidebar:
-        st.header("Find a company")
-        query = st.text_input("Search by name, NSE ticker or BSE code", value="RELIANCE")
-        results = search_companies(query) if query else pd.DataFrame()
-
-        selected_row = None
-        if not results.empty:
-            options = []
-            for _, r in results.iterrows():
-                nse = r.get("NSE Ticker")
-                bse = r.get("BSE Code")
-                tag_bits = []
-                if pd.notna(nse):
-                    tag_bits.append(f"NSE:{nse}")
-                if pd.notna(bse):
-                    tag_bits.append(f"BSE:{bse}")
-                options.append(f"{r['Display Name']}  ({', '.join(tag_bits)})")
-            choice = st.selectbox("Matches", options, index=0)
-            selected_row = results.iloc[options.index(choice)]
-        else:
-            st.info("Type a company name, NSE ticker (e.g. RELIANCE) or BSE code (e.g. 500325).")
-
-        st.divider()
-        window_days = st.slider("Deals window (days)", 7, 730, 180, step=7)
-        st.caption("Applies to Block Deals / Bulk Deals / Insider Trades below.")
-
-    if selected_row is None:
-        st.stop()
-
-    nse_ticker = selected_row.get("NSE Ticker")
-    bse_code = selected_row.get("BSE Code")
-    nse_ticker = None if pd.isna(nse_ticker) else str(nse_ticker)
-    bse_code = None if pd.isna(bse_code) else str(int(float(bse_code))) if str(bse_code).replace(".", "").isdigit() else str(bse_code)
-
     with st.spinner("Fetching from screener.in ..."):
-        resolved = resolve_company(nse_ticker, bse_code)
-
+        resolved = resolve_company_full(session, nse_ticker, bse_code)
     if resolved is None:
-        st.error(
-            "Couldn't reach screener.in for this company. It may be blocked from this "
-            "network, or the ticker/code doesn't exist on Screener."
-        )
-        st.stop()
+        st.error("Couldn't reach screener.in for this company.")
+        return
 
     company_name = parse_company_name(resolved["html"])
     st.subheader(company_name)
@@ -469,154 +587,215 @@ def main():
         f"•  identifier used: `{resolved['id_used']}`"
     )
 
-    # --------------------------------------------------------------------------- #
-    # Shareholding pattern
-    # --------------------------------------------------------------------------- #
-
     sh_df = parse_shareholding(resolved["html"])
-
     st.markdown("### Shareholding Pattern")
     if sh_df.empty:
         st.warning("No shareholding pattern table found on this page.")
     else:
         quarters = list(sh_df.columns)
-        latest_q = quarters[-1]
-        prev_q = quarters[-2] if len(quarters) > 1 else None
-
-        cat_order = ["Promoters", "FIIs", "DIIs", "Government", "Public"]
-        cat_order = [c for c in cat_order if c in sh_df.index]
-
+        latest_q, prev_q = quarters[-1], (quarters[-2] if len(quarters) > 1 else None)
+        cat_order = [c for c in ["Promoters", "FIIs", "DIIs", "Government", "Public"] if c in sh_df.index]
         cols = st.columns(len(cat_order) + 1)
         for i, cat in enumerate(cat_order):
             latest_val = pct_to_float(sh_df.loc[cat, latest_q])
             prev_val = pct_to_float(sh_df.loc[cat, prev_q]) if prev_q else None
             delta = None if (latest_val is None or prev_val is None) else round(latest_val - prev_val, 2)
-            cols[i].metric(
-                cat,
-                f"{latest_val:.2f}%" if latest_val is not None else "-",
-                f"{delta:+.2f} pp" if delta is not None else None,
-            )
+            cols[i].metric(cat, f"{latest_val:.2f}%" if latest_val is not None else "-",
+                            f"{delta:+.2f} pp" if delta is not None else None)
         if "No. of Shareholders" in sh_df.index:
             cols[-1].metric("No. of Shareholders", sh_df.loc["No. of Shareholders", latest_q])
 
-        left, right = st.columns([1, 2])
-        with left:
-            pie_vals = {c: pct_to_float(sh_df.loc[c, latest_q]) for c in cat_order}
-            pie_df = pd.DataFrame({"Category": list(pie_vals.keys()), "Percent": list(pie_vals.values())})
-            st.caption(f"Breakup as of {latest_q}")
-            st.dataframe(pie_df.set_index("Category"), use_container_width=True)
-        with right:
-            trend = sh_df.loc[[c for c in cat_order if c in sh_df.index]].T
-            trend = trend.apply(lambda col: col.map(pct_to_float))
-            st.caption("Quarter-on-quarter trend (%)")
-            st.line_chart(trend)
-
+        trend = sh_df.loc[cat_order].T.apply(lambda col: col.map(pct_to_float))
+        st.caption("Quarter-on-quarter trend (%)")
+        st.line_chart(trend)
         with st.expander("Full shareholding table"):
             st.dataframe(sh_df, use_container_width=True)
 
-    # --------------------------------------------------------------------------- #
-    # Trades (block / bulk / insider)
-    # --------------------------------------------------------------------------- #
-
     st.markdown("### Recent Trades")
+    trades_path = parse_trades_url(resolved["html"])
+    if not trades_path:
+        st.warning("No Trades link found for this company.")
+        return
+    with st.spinner("Fetching trades ..."):
+        trades_html = fetch_url(session, BASE + trades_path)
+    if not trades_html:
+        st.error("Could not fetch the Trades page.")
+        return
+    if looks_login_gated(trades_html):
+        st.error("Trades page looks login-gated — check your `cookies.pkl` is valid.")
+        return
 
-    trades_url_path = parse_trades_url(resolved["html"])
-    if not trades_url_path:
-        st.warning("No Trades link found for this company on screener.in.")
+    cutoff = datetime.now() - timedelta(days=window_days)
+    block_df = parse_block_or_bulk(trades_html, DEAL_TABS["block"])
+    bulk_df = parse_block_or_bulk(trades_html, DEAL_TABS["bulk"])
+
+    def prep(df):
+        if df.empty:
+            return df
+        df = df[df["Date"] >= cutoff].copy()
+        df["Action"] = df["Action"].map(normalise_action)
+        df["Tag"] = df["Person / Entity"].map(classify_investor)
+        return df.sort_values("Date", ascending=False)
+
+    block_recent, bulk_recent = prep(block_df), prep(bulk_df)
+    tab1, tab2 = st.tabs(["📌 Block Deals", "📦 Bulk Deals"])
+    for tab, df, label in [(tab1, block_recent, "block"), (tab2, bulk_recent, "bulk")]:
+        with tab:
+            if df.empty:
+                st.info(f"No {label} deals in the last {window_days} day(s).")
+            else:
+                show = df.copy()
+                show["Date"] = show["Date"].dt.strftime("%d %b %Y")
+                st.dataframe(show[["Date", "Person / Entity", "Tag", "Action", "Quantity", "Price"]],
+                             use_container_width=True, hide_index=True)
+
+
+def bulk_scan_mode(session, idx):
+    st.caption(
+        "Scan many companies at once for Block/Bulk deals in the last N days. "
+        "Each company costs 2 page fetches, so keep the list reasonable and use "
+        "a few workers — screener.in will rate-limit or log you out if hammered."
+    )
+
+    source = st.radio(
+        "Company list source",
+        ["Paste tickers/codes/names", "Upload watchlist CSV", "Full NSE universe", "Full BSE universe"],
+        horizontal=False,
+    )
+
+    companies = []
+    if source == "Paste tickers/codes/names":
+        text = st.text_area(
+            "One per line (NSE ticker, BSE code, or company name)",
+            height=160,
+            placeholder="RELIANCE\nTCS\n500325\nHDFC BANK",
+        )
+        for line in text.splitlines():
+            resolved = resolve_identifier_line(line, idx)
+            if resolved:
+                companies.append(resolved)
+
+    elif source == "Upload watchlist CSV":
+        up = st.file_uploader("CSV with a column of names / NSE tickers / BSE codes", type=["csv"])
+        if up is not None:
+            wl = pd.read_csv(up)
+            col = wl.columns[0]
+            st.caption(f"Using column `{col}` ({len(wl)} rows)")
+            for val in wl[col].astype(str):
+                resolved = resolve_identifier_line(val, idx)
+                if resolved:
+                    companies.append(resolved)
+
     else:
-        full_trades_url = BASE + trades_url_path
-        with st.spinner("Fetching trades ..."):
-            trades_html = fetch_url(full_trades_url)
+        nse, bse = load_ticker_lists()
+        pool_df = nse if source == "Full NSE universe" else bse
+        max_n = st.number_input(
+            f"Max companies to scan (universe has {len(pool_df)})",
+            min_value=1, max_value=int(len(pool_df)), value=min(100, len(pool_df)), step=10,
+        )
+        subset = pool_df.head(int(max_n))
+        for _, r in subset.iterrows():
+            if source == "Full NSE universe":
+                companies.append((r["Name"], r["NSE Ticker"], None))
+            else:
+                companies.append((r["Name"], None, r["BSE Code"]))
 
-        if not trades_html:
-            st.error("Could not fetch the Trades page.")
-        else:
-            cutoff = datetime.now() - timedelta(days=window_days)
+    companies = list({c[0]: c for c in companies}.values())  # de-dupe by name
 
-            block_df = parse_block_or_bulk(trades_html, DEAL_TABS["block"])
-            bulk_df = parse_block_or_bulk(trades_html, DEAL_TABS["bulk"])
-            insider_df = parse_insider(trades_html)
+    c1, c2, c3 = st.columns(3)
+    window_days = c1.number_input("Deals in last N days", min_value=1, max_value=365, value=3, step=1)
+    max_workers = c2.slider("Parallel workers", 1, 16, 6)
+    delay_ms = c3.slider("Polite delay per request (ms)", 0, 1000, 150, step=50)
 
-            def prep(df):
-                if df.empty:
-                    return df
-                df = df.copy()
-                df = df[df["Date"] >= cutoff]
-                df["Action"] = df["Action"].map(normalise_action)
-                df["Tag"] = df["Person / Entity"].map(classify_investor)
-                df = df.sort_values("Date", ascending=False)
-                return df
+    st.write(f"**{len(companies)}** companies queued.")
 
-            block_recent = prep(block_df)
-            bulk_recent = prep(bulk_df)
+    if st.button("▶️ Run scan", type="primary", disabled=(len(companies) == 0)):
+        progress = st.progress(0.0, text="Starting...")
+        live_table = st.empty()
+        collected = []
 
-            tab1, tab2, tab3, tab4 = st.tabs(
-                ["📌 Block Deals", "📦 Bulk Deals", "👤 Insider Trades", "🧮 FII/DII Net Flow"]
+        def on_progress(done, total, result):
+            progress.progress(done / total, text=f"{done}/{total} — {result['name']} ({result['status']})")
+            if not result["deals"].empty:
+                collected.append(result["deals"])
+                merged = pd.concat(collected, ignore_index=True).sort_values("Date", ascending=False)
+                shown = merged.copy()
+                shown["Date"] = shown["Date"].dt.strftime("%d %b %Y")
+                live_table.dataframe(
+                    shown[["Date", "Company", "Deal Type", "Person / Entity", "Tag", "Action", "Quantity", "Price"]],
+                    use_container_width=True, hide_index=True,
+                )
+
+        deals_df, status_counts, log = run_bulk_scan(
+            session, companies, window_days, max_workers, delay_ms / 1000.0, progress_cb=on_progress
+        )
+        progress.progress(1.0, text="Done.")
+
+        st.markdown("#### Summary")
+        st.write(status_counts)
+        if status_counts.get("login_required"):
+            st.warning(
+                f"{status_counts['login_required']} companies looked login-gated — "
+                "your session cookie may have expired mid-scan."
             )
 
-            with tab1:
-                if block_recent.empty:
-                    st.info(f"No block deals in the last {window_days} days.")
-                else:
-                    show = block_recent.copy()
-                    show["Date"] = show["Date"].dt.strftime("%d %b %Y")
-                    st.dataframe(
-                        show[["Date", "Person / Entity", "Tag", "Action", "Quantity", "Price"]],
-                        use_container_width=True,
-                        hide_index=True,
-                    )
+        if deals_df.empty:
+            st.info(f"No Block/Bulk deals found in the last {window_days} day(s) across the scanned companies.")
+        else:
+            deals_df = deals_df.sort_values("Date", ascending=False)
+            show = deals_df.copy()
+            show["Date"] = show["Date"].dt.strftime("%d %b %Y")
+            st.dataframe(
+                show[["Date", "Company", "Deal Type", "Person / Entity", "Tag", "Action", "Quantity", "Price"]],
+                use_container_width=True, hide_index=True,
+            )
+            st.download_button(
+                "⬇️ Download results (CSV)",
+                show.to_csv(index=False).encode("utf-8"),
+                file_name=f"screener_deals_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+                mime="text/csv",
+            )
 
-            with tab2:
-                if bulk_recent.empty:
-                    st.info(f"No bulk deals in the last {window_days} days.")
-                else:
-                    show = bulk_recent.copy()
-                    show["Date"] = show["Date"].dt.strftime("%d %b %Y")
-                    st.dataframe(
-                        show[["Date", "Person / Entity", "Tag", "Action", "Quantity", "Price"]],
-                        use_container_width=True,
-                        hide_index=True,
-                    )
+        with st.expander("Per-company log"):
+            st.dataframe(pd.DataFrame(log), use_container_width=True, hide_index=True)
 
-            with tab3:
-                if insider_df.empty:
-                    st.info("No insider trades found.")
-                else:
-                    ins = insider_df[insider_df["Month"] >= cutoff.replace(day=1)].copy()
-                    if ins.empty:
-                        st.info(f"No insider trades in the last {window_days} days.")
-                    else:
-                        ins["Month"] = ins["Month"].dt.strftime("%b %Y")
-                        ins = ins.sort_values("Month", ascending=False)
-                        st.dataframe(
-                            ins[["Month", "Person", "Role", "Direction", "Quantity", "Avg Price", "Value (Rs. Lacs)"]],
-                            use_container_width=True,
-                            hide_index=True,
-                        )
 
-            with tab4:
-                combined = pd.concat([block_recent, bulk_recent], ignore_index=True) if not (
-                    block_recent.empty and bulk_recent.empty
-                ) else pd.DataFrame()
-                if combined.empty:
-                    st.info(f"No block/bulk deals in the last {window_days} days to summarise.")
-                else:
-                    combined["Signed Qty"] = combined.apply(
-                        lambda r: r["Quantity"] if r["Action"] == "Buy" else (-r["Quantity"] if r["Action"] == "Sell" else 0),
-                        axis=1,
-                    )
-                    net = combined.groupby("Tag")["Signed Qty"].sum().sort_values(ascending=False)
-                    st.caption(
-                        f"Net shares bought (+) / sold (–) via Block + Bulk deals, last {window_days} days. "
-                        "Tagging is a heuristic based on entity name — verify manually before relying on it."
-                    )
-                    st.bar_chart(net)
-                    st.dataframe(net.rename("Net Quantity").to_frame(), use_container_width=True)
+def main():
+    st.set_page_config(page_title="Screener FII/DII & Block Deal Scraper", layout="wide")
+    st.title("📊 Screener.in Shareholding & Deals Scraper")
+
+    cookie_path = find_cookie_file()
+    session, has_cookies = build_session(cookie_path)
+    render_login_banner(session, cookie_path, has_cookies)
+
+    with st.sidebar:
+        st.header("Cookies")
+        st.caption(f"Looking for: {', '.join(os.path.basename(p) for p in COOKIE_CANDIDATES)}")
+        if cookie_path:
+            st.caption(f"✅ Using `{cookie_path}`")
+        uploaded = st.file_uploader("...or upload cookies.pkl for this session", type=["pkl"])
+        if uploaded is not None:
+            tmp_path = os.path.join(APP_DIR, "cookies.pkl")
+            with open(tmp_path, "wb") as f:
+                f.write(uploaded.getbuffer())
+            st.cache_resource.clear()
+            st.success("Cookie file saved — rerunning with new session.")
+            st.rerun()
+
+        st.divider()
+        mode = st.radio("Mode", ["🔎 Single Company", "📡 Bulk Scan – Recent Deals"])
+
+    idx = build_search_index()
+    if mode == "🔎 Single Company":
+        single_company_mode(session, idx)
+    else:
+        bulk_scan_mode(session, idx)
 
     st.divider()
     st.caption(
-        "Data pulled live from screener.in. This tool is for research convenience only — "
-        "always cross-check against exchange filings (NSE/BSE) before making decisions."
+        "Data pulled live from screener.in using your authenticated session. "
+        "FII/DII tagging is a name-based heuristic, not authoritative — verify "
+        "before relying on it. Research convenience only, not investment advice."
     )
 
 
