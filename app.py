@@ -767,12 +767,40 @@ def render_login_banner(session, cookie_path, has_cookies):
             "browser session and save them as `cookies.pkl` next to `app.py`."
         )
         return
-    with st.spinner("Checking login status..."):
-        ok, msg = check_login(session)
-    if ok:
-        st.success(f"🔓 {msg} (`{os.path.basename(cookie_path)}`)")
+
+    # Streamlit re-runs this whole script on every widget interaction (every
+    # button click, every dropdown change), so calling check_login() here
+    # unconditionally was hitting screener.in/ on EVERY rerun - not once per
+    # session. That's wasted requests at best and, if screener.in or the
+    # egress path is rate-limiting / flaky, actively made "Connection
+    # refused" errors more likely to surface mid-scan. Cache the result in
+    # session_state and only re-check when the user explicitly asks to, or
+    # after a stretch of time has passed.
+    cache_key = "login_check_result"
+    cache_ts_key = "login_check_ts"
+    now = time.time()
+    stale = (
+        cache_key not in st.session_state
+        or now - st.session_state.get(cache_ts_key, 0) > 600  # 10 min
+    )
+
+    header_col, refresh_col = st.columns([5, 1])
+    if refresh_col.button("🔄 Recheck login", key="recheck_login_btn"):
+        stale = True
+
+    if stale:
+        with st.spinner("Checking login status..."):
+            ok, msg = check_login(session)
+        st.session_state[cache_key] = (ok, msg)
+        st.session_state[cache_ts_key] = now
     else:
-        st.warning(f"⚠️ {msg}. Deals data may come back empty — re-export `cookies.pkl` if so.")
+        ok, msg = st.session_state[cache_key]
+
+    with header_col:
+        if ok:
+            st.success(f"🔓 {msg} (`{os.path.basename(cookie_path)}`)")
+        else:
+            st.warning(f"⚠️ {msg}. Deals data may come back empty — re-export `cookies.pkl` if so.")
 
 
 def single_company_mode(session, idx):
